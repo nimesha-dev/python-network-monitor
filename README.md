@@ -301,6 +301,26 @@ Users can export events into:
 
 This allows the information to be used for further analysis and reporting.
 
+## 5.9 Web Dashboard
+
+The project includes an interactive browser dashboard for viewing all live data without entering terminal commands.
+
+Run:
+
+```bash
+python -m network_monitor.web
+```
+
+It opens `http://127.0.0.1:8765/` and provides:
+
+- KPI cards for interfaces, connections, listeners, traffic rates and security events.
+- A live upload/download rate chart and an events-by-severity chart.
+- Auto-refresh every 2 seconds from a background monitoring thread.
+- Pause/resume, section navigation and instant manual refresh.
+- Filters and search for connections and events, plus sortable table columns.
+- Clickable severity chart bars and event rows with full evidence JSON.
+- CSV and JSON download of stored security events.
+
 ---
 
 # 6. System Architecture
@@ -308,6 +328,8 @@ This allows the information to be used for further analysis and reporting.
 The application follows a modular architecture.
 
 Each module is responsible for a particular part of the system.
+
+There are three entry points sharing the same modules: `main.py` (interactive menu), `web.py` (browser dashboard) and `showcase.py` (one-command tour).
 
 This is a conceptual overview, not an exact execution sequence:
 
@@ -517,7 +539,9 @@ python-network-monitor/
 │       ├── storage.py
 │       ├── dashboard.py
 │       ├── packet_tools.py
-│       └── filters.py
+│       ├── filters.py
+│       ├── showcase.py
+│       └── web.py
 │
 ├── tests/
 │   ├── __init__.py
@@ -698,6 +722,22 @@ The test directory contains automated tests for the main application components.
 Each test module checks the behaviour of a particular component.
 
 This helps identify errors and ensures that changes do not unnecessarily break existing functionality.
+
+## 9.11 web.py — Web Dashboard
+
+web.py serves an interactive HTML dashboard over a local HTTP server using only the Python standard library.
+
+A background thread collects live network data, runs the detection engine and stores events while the browser page auto-refreshes every 2 seconds.
+
+It provides charts, filters, search, sorting, event evidence details and CSV/JSON downloads without requiring any terminal input after startup.
+
+## 9.12 showcase.py — One-Command Feature Tour
+
+showcase.py prints a guided report covering every implemented feature in a single command.
+
+It demonstrates configuration, live collection, filtering, the full detection rules catalogue, monitoring rates, PCAP analysis, storage, exports and the automated test suite.
+
+This gives new users and reviewers a quick overview without navigating the interactive menu.
 
 ---
 

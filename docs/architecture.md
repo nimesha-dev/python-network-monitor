@@ -12,6 +12,8 @@
 | `storage.py` | SQLite persistence. Every operation opens its own connection, commits on success, rolls back on failure and **always closes** the connection. Search/filter/export helpers for investigation. |
 | `dashboard.py` | Rich terminal presentation (tables, panels). |
 | `main.py` | Menus and orchestration: overview, filtering, live monitoring, capture, analysis, events, investigation, history, export. |
+| `web.py` | Local HTTP server (standard library only) serving an auto-refreshing HTML dashboard: KPIs, live charts, filters, search, sorting, event evidence modal and CSV/JSON downloads. A background thread runs collection and detection. |
+| `showcase.py` | One-command guided tour printing every implemented feature (config, overview, filtering, rules, monitoring, PCAP, storage, exports, tests). |
 | `config.py` | Defaults, validated configuration loading (per-field type/range checks with fallback to defaults) and output directories. |
 | `filters.py` / investigation | `storage.search_events(ip=…, severity=…, category=…)` powers the investigation menu (search, combined filters, timeline, filtered export). |
 
