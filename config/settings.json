@@ -1,0 +1,26 @@
+{
+    "monitor_interval": 2.0,
+    "packet_capture_duration": 30,
+    "port_scan_threshold": 15,
+    "repeated_attempt_threshold": 10,
+    "dos_packet_threshold": 100,
+    "detection_window_seconds": 10,
+    "unusual_remote_connection_threshold": 15,
+    "suspicious_ports": [
+        23,
+        2323,
+        4444,
+        5555,
+        6667,
+        31337
+    ],
+    "allowed_listening_ports": [
+        22,
+        53,
+        80,
+        443,
+        631,
+        5432
+    ],
+    "high_bandwidth_threshold_bps": 10485760
+}

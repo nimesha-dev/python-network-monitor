@@ -1,379 +1,436 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.live import Live
-from rich import box
 
-from network_monitor.interfaces import (
-    get_network_interfaces,
-    get_ip_addresses,
-    get_network_statistics,
-    get_network_connections,
-    get_listening_ports,
-    format_bytes
+from network_monitor.collector import collect_snapshot
+from network_monitor.config import Settings, prepare_directories, PCAP_DIR
+from network_monitor.dashboard import (
+    display_header, display_report, display_speeds, display_events,
+    display_packet_summary,
 )
+from network_monitor.detector import SecurityDetector
+from network_monitor.filters import filter_connections
+from network_monitor.monitor import run_monitoring
+from network_monitor.packet_tools import capture_packets, analyse_pcap, PcapError
+from network_monitor.storage import Storage
 
-from network_monitor.traffic import get_network_speed
-
-
-# Create Rich Console
 console = Console()
 
 
-def display_header():
-    """Display the application header."""
-
-    console.print(
-        Panel(
-            "[bold cyan]PYTHON NETWORK MONITOR[/bold cyan]\n"
-            "[white]Network Information and Monitoring System[/white]",
-            border_style="cyan",
-            padding=(1, 2),
-            expand=True
-        )
-    )
-
-
-def display_network_summary(interfaces, connections, listening_ports):
-    """Display a summary of the current network status."""
-
-    total_interfaces = len(interfaces)
-
-    active_interfaces = sum(
-        1 for interface in interfaces
-        if interface["status"] == "UP"
-    )
-
-    inactive_interfaces = total_interfaces - active_interfaces
-
-    summary = (
-        f"[bold cyan]Total Interfaces:[/bold cyan] {total_interfaces}    "
-        f"[bold green]Active:[/bold green] {active_interfaces}    "
-        f"[bold red]Inactive:[/bold red] {inactive_interfaces}\n\n"
-        f"[bold cyan]Active Connections:[/bold cyan] {len(connections)}    "
-        f"[bold yellow]Listening Ports:[/bold yellow] "
-        f"{len(listening_ports)}"
-    )
-
-    console.print(
-        Panel(
-            summary,
-            title="[bold white]NETWORK SUMMARY[/bold white]",
-            border_style="blue",
-            padding=(1, 2),
-            expand=True
-        )
-    )
-
-
-def display_network_interfaces(interfaces):
-    """Display available network interfaces."""
-
-    console.print("\n[bold cyan]1. NETWORK INTERFACES[/bold cyan]")
-
-    table = Table(
-        title="Available Network Interfaces",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold magenta",
-        expand=True
-    )
-
-    table.add_column("Interface Name", style="cyan")
-    table.add_column("Interface Type")
-    table.add_column("Status", justify="center")
-
-    for interface in interfaces:
-
-        status = (
-            "[bold green]UP[/bold green]"
-            if interface["status"] == "UP"
-            else "[bold red]DOWN[/bold red]"
-        )
-
+def show_connections(connections):
+    table = Table(title=f"FILTERED CONNECTIONS ({len(connections)})")
+    for heading in ("Protocol", "Local", "Remote", "Status", "PID", "Process"):
+        table.add_column(heading)
+    for item in connections:
         table.add_row(
-            interface["name"],
-            interface["type"],
-            status
+            item["protocol"], f'{item["local_ip"]}:{item["local_port"]}',
+            f'{item["remote_ip"]}:{item["remote_port"]}', item["status"],
+            str(item["pid"] or "-"), item["process_name"],
         )
-
+    if not connections:
+        table.add_row("-", "-", "-", "-", "-", "No matching connections")
     console.print(table)
 
 
-def display_ip_information(ip_information):
-    """Display IPv4 and IPv6 address information."""
+def filter_menu(snapshot):
+    connections = snapshot["connections"]
+    while True:
+        console.print("\n[bold cyan]CONNECTION FILTERING[/bold cyan]")
+        console.print("1. Show all  2. Protocol  3. Status  4. Process  5. Port  6. Combined  0. Back")
+        choice = console.input("Select option: ").strip()
+        if choice == "0":
+            return
+        protocol = status = process = None
+        port = None
+        if choice in ("2", "6"):
+            protocol = console.input("Protocol (TCP/UDP/ALL): ").strip().upper() or None
+            if protocol and protocol not in ("TCP", "UDP", "ALL"):
+                console.print("[red]Enter TCP, UDP, or ALL.[/red]")
+                continue
+        if choice in ("3", "6"):
+            status = console.input("Status (e.g. ESTABLISHED/LISTEN/ALL): ").strip().upper() or None
+        if choice in ("4", "6"):
+            process = console.input("Process name (or ALL): ").strip() or None
+        if choice in ("5", "6"):
+            raw = console.input("Port (0-65535, blank for all): ").strip()
+            if raw:
+                try:
+                    port = int(raw)
+                    if not 0 <= port <= 65535:
+                        raise ValueError
+                except ValueError:
+                    console.print("[red]Port must be an integer from 0 to 65535.[/red]")
+                    continue
+        if choice == "1":
+            result = filter_connections(connections)
+        elif choice in ("2", "3", "4", "5", "6"):
+            result = filter_connections(connections, protocol, status, process, port)
+        else:
+            console.print("[red]Invalid menu option.[/red]")
+            continue
+        show_connections(result)
 
-    console.print("\n[bold cyan]2. IP ADDRESS INFORMATION[/bold cyan]")
 
-    table = Table(
-        title="Network IP Address Information",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        expand=True
-    )
+def render_live(snapshot, speeds, events):
+    """Render one frame of the live monitoring view."""
+    console.print("[bold cyan]PYTHON NETWORK MONITOR — LIVE[/bold cyan]")
+    console.print(f"Connections: {len(snapshot['connections'])} | "
+                  f"Interfaces UP: {sum(x['status'] == 'UP' for x in snapshot['interfaces'])} | "
+                  f"Listening TCP ports: {len(snapshot['listening_ports'])}")
+    console.print(display_speeds(speeds))
+    display_events(events)
 
-    table.add_column("Interface", style="cyan")
-    table.add_column("IPv4 Address")
-    table.add_column("IPv6 Address")
 
-    for interface in ip_information:
+def live_monitor(settings, storage):
+    console.print("[yellow]Live monitoring. Press Ctrl+C to stop.[/yellow]")
+    def update(snapshot, speeds, events):
+        console.clear()
+        render_live(snapshot, speeds, events)
+    try:
+        run_monitoring(None, settings, storage, update)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Live monitoring stopped.[/yellow]")
 
-        table.add_row(
-            interface["name"],
-            interface["ipv4"],
-            interface["ipv6"]
+
+def packet_capture_menu(settings, storage):
+    interfaces = collect_snapshot()["interfaces"]
+    console.print("Available interfaces: " + ", ".join(x["name"] for x in interfaces))
+    interface = console.input("Interface (blank for default): ").strip() or None
+    raw_duration = console.input(
+        f"Capture duration in seconds [{settings.packet_capture_duration}]: "
+    ).strip()
+    try:
+        duration = int(raw_duration) if raw_duration else settings.packet_capture_duration
+        if duration < 1 or duration > 3600:
+            raise ValueError
+    except ValueError:
+        console.print("[red]Duration must be between 1 and 3600 seconds.[/red]")
+        return
+    bpf_filter = console.input(
+        "Capture filter (BPF syntax, e.g. 'tcp port 80', blank for none): "
+    ).strip() or None
+    raw_max = console.input("Max packets (blank for unlimited): ").strip()
+    max_packets = None
+    if raw_max:
+        try:
+            max_packets = int(raw_max)
+            if max_packets < 1:
+                raise ValueError
+        except ValueError:
+            console.print("[red]Max packets must be a positive integer.[/red]")
+            return
+
+    console.print("[yellow]Starting packet capture. Packet capture may require sudo/root privileges.[/yellow]")
+    try:
+        rows, path = capture_packets(interface, duration,
+                                     bpf_filter=bpf_filter,
+                                     max_packets=max_packets)
+    except PermissionError:
+        console.print("[red]Permission denied. On Linux, run the application with appropriate capture permissions.[/red]")
+        return
+    except ValueError as error:
+        console.print(f"[red]{error}[/red]")
+        return
+    except Exception as error:
+        console.print(f"[red]Capture failed: {error}[/red]")
+        return
+
+    detector = SecurityDetector(settings)
+    events = detector.inspect_packets(rows)
+    for event in events:
+        storage.save_event(event)
+    console.print(f"[green]Captured {len(rows)} packets.[/green]")
+    console.print(f"PCAP saved to: {path}")
+    console.print(f"Packet-level security events: {len(events)}")
+    display_events(events)
+
+
+def pcap_analysis_menu(settings, storage):
+    raw_path = console.input(f"PCAP path (default folder: {PCAP_DIR}): ").strip()
+    if not raw_path:
+        console.print("[yellow]No path entered.[/yellow]")
+        return
+    path = Path(raw_path).expanduser()
+    raw_max = console.input("Max packets to analyse (blank for all): ").strip()
+    max_packets = None
+    if raw_max:
+        try:
+            max_packets = int(raw_max)
+            if max_packets < 1:
+                raise ValueError
+        except ValueError:
+            console.print("[red]Max packets must be a positive integer.[/red]")
+            return
+    try:
+        summary, events, _rows = analyse_pcap(
+            path, detector=SecurityDetector(settings), max_packets=max_packets
         )
+    except FileNotFoundError as error:
+        console.print(f"[red]{error}[/red]")
+        return
+    except (PcapError, ValueError) as error:
+        console.print(f"[red]{error}[/red]")
+        return
+    except Exception as error:
+        console.print(f"[red]PCAP analysis failed: {error}[/red]")
+        return
+    display_packet_summary(summary)
+    for event in events:
+        storage.save_event(event)
+    console.print(f"[green]Rule-based events found: {len(events)}[/green]")
+    display_events(events)
 
+
+def _severity_style(severity: str) -> str:
+    return {"HIGH": "red", "MEDIUM": "yellow", "INFO": "cyan"}.get(severity, "white")
+
+
+def _print_event_table(events, title: str, show_id: bool = True) -> None:
+    headings = (["ID"] if show_id else []) + [
+        "Time", "Severity", "Category", "Source", "Destination", "Description",
+    ]
+    table = Table(title=f"{title} ({len(events)})")
+    for heading in headings:
+        table.add_column(heading)
+    for event in events:
+        severity = event["severity"]
+        row = (([str(event["id"])] if show_id else []) + [
+            event["timestamp"],
+            f"[{_severity_style(severity)}]{severity}[/{_severity_style(severity)}]",
+            event["category"],
+            event["source_ip"] or "-",
+            event["destination_ip"] or "-",
+            event["description"],
+        ])
+        table.add_row(*row)
+    if not events:
+        table.add_row(*( ["-"] * (len(headings) - 1) + ["No matching events"] ))
     console.print(table)
 
 
-def display_network_statistics(statistics):
-    """Display cumulative network traffic statistics."""
+def show_events(storage):
+    _print_event_table(storage.recent_events(100), "RECENT SECURITY EVENTS")
 
-    console.print("\n[bold cyan]3. NETWORK TRAFFIC STATISTICS[/bold cyan]")
 
-    table = Table(
-        title="Network Traffic Statistics",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        expand=True
-    )
+def show_event_details(storage, event_id=None):
+    """Display the full evidence/details of a single stored event."""
+    if event_id is None:
+        raw = console.input("Event ID: ").strip()
+        try:
+            event_id = int(raw)
+        except ValueError:
+            console.print("[red]Event ID must be an integer.[/red]")
+            return
+    event = storage.get_event(event_id)
+    if event is None:
+        console.print(f"[red]No event with ID {event_id}.[/red]")
+        return
+    try:
+        details = json.dumps(json.loads(event["details"] or "{}"), indent=2)
+    except (json.JSONDecodeError, TypeError):
+        details = str(event["details"])
+    severity = event["severity"]
+    style = _severity_style(severity)
+    console.print(Panel(
+        f"ID: [bold]{event['id']}[/bold]\n"
+        f"Time: {event['timestamp']}\n"
+        f"Severity: [{style}]{severity}[/{style}]\n"
+        f"Category: {event['category']}\n"
+        f"Source: {event['source_ip'] or '-'}\n"
+        f"Destination: {event['destination_ip'] or '-'}\n"
+        f"Description: {event['description']}\n\n"
+        f"[bold]Evidence / details:[/bold]\n{details}",
+        title=f"EVENT #{event['id']} DETAILS", border_style="blue",
+    ))
 
-    table.add_column("Interface", style="cyan")
-    table.add_column("Data Sent", justify="right")
-    table.add_column("Data Received", justify="right")
-    table.add_column("Packets Sent", justify="right")
-    table.add_column("Packets Received", justify="right")
-    table.add_column("Errors In", justify="right")
-    table.add_column("Errors Out", justify="right")
-    table.add_column("Drops In", justify="right")
-    table.add_column("Drops Out", justify="right")
 
-    for interface in statistics:
+def show_timeline(storage, events=None):
+    """View events in chronological (oldest first) order."""
+    if events is None:
+        events = storage.search_events(limit=200, ascending=True)
+    _print_event_table(events, "EVENT TIMELINE (oldest first)")
 
-        table.add_row(
-            interface["name"],
-            format_bytes(interface["bytes_sent"]),
-            format_bytes(interface["bytes_recv"]),
-            str(interface["packets_sent"]),
-            str(interface["packets_recv"]),
-            str(interface["errors_in"]),
-            str(interface["errors_out"]),
-            str(interface["drops_in"]),
-            str(interface["drops_out"])
+
+def _prompt_severity() -> str | None:
+    raw = console.input(
+        "Severity (INFO/MEDIUM/HIGH, blank to cancel): "
+    ).strip().upper()
+    if not raw:
+        return None
+    if raw not in ("INFO", "MEDIUM", "HIGH"):
+        console.print("[red]Severity must be INFO, MEDIUM or HIGH.[/red]")
+        return ""
+    return raw
+
+
+def investigation_menu(storage):
+    """Investigate stored events: search, filter, inspect, export."""
+    last_rows = storage.recent_events(100)
+    while True:
+        console.print(f"\n[bold cyan]EVENT INVESTIGATION[/bold cyan] "
+                      f"[dim](last result: {len(last_rows)} events)[/dim]")
+        console.print(
+            "1. Search by IP\n"
+            "2. Filter by severity\n"
+            "3. Filter by category\n"
+            "4. Combined filter (IP + severity + category)\n"
+            "5. View event details\n"
+            "6. Event timeline\n"
+            "7. Export last results\n"
+            "0. Back"
         )
+        choice = console.input("Select option: ").strip()
+        try:
+            if choice == "0":
+                return
+            elif choice == "1":
+                ip = console.input("IP address: ").strip()
+                if not ip:
+                    console.print("[yellow]No IP entered.[/yellow]")
+                    continue
+                last_rows = storage.search_events(ip=ip, limit=200)
+                _print_event_table(last_rows, f"EVENTS FOR IP {ip}")
+            elif choice == "2":
+                severity = _prompt_severity()
+                if severity is None:
+                    continue
+                if severity == "":
+                    continue
+                last_rows = storage.search_events(severity=severity, limit=200)
+                _print_event_table(last_rows, f"{severity} EVENTS")
+            elif choice == "3":
+                known = storage.event_categories()
+                if known:
+                    console.print("[dim]Known categories: "
+                                  + ", ".join(known) + "[/dim]")
+                category = console.input("Category: ").strip()
+                if not category:
+                    console.print("[yellow]No category entered.[/yellow]")
+                    continue
+                last_rows = storage.search_events(category=category, limit=200)
+                _print_event_table(last_rows, f"CATEGORY: {category}")
+            elif choice == "4":
+                ip = console.input("IP (blank for any): ").strip() or None
+                severity = _prompt_severity()
+                if severity == "":
+                    continue
+                severity = severity or None
+                category = console.input("Category (blank for any): ").strip() or None
+                last_rows = storage.search_events(
+                    ip=ip, severity=severity, category=category, limit=200
+                )
+                _print_event_table(last_rows, "COMBINED FILTER RESULTS")
+            elif choice == "5":
+                show_event_details(storage)
+            elif choice == "6":
+                show_timeline(storage)
+            elif choice == "7":
+                if not last_rows:
+                    console.print("[yellow]No events to export.[/yellow]")
+                    continue
+                fmt = console.input("Export format (csv/json): ").strip().lower()
+                path = storage.export_events(fmt, rows=last_rows)
+                console.print(f"[green]Export created: {path} "
+                              f"({len(last_rows)} events)[/green]")
+            else:
+                console.print("[red]Invalid option. Choose 0-7.[/red]")
+        except ValueError as error:
+            console.print(f"[red]{error}[/red]")
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            console.print(f"[red]Investigation failed: {error}[/red]")
 
+
+def show_history(storage):
+    rows = storage.recent_snapshots(20)
+    table = Table(title="RECENT MONITORING HISTORY")
+    for heading in ("Time", "Interfaces", "UP", "Connections", "TCP Listeners"):
+        table.add_column(heading)
+    for row in rows:
+        table.add_row(row["timestamp"], str(row["interface_count"]),
+                      str(row["active_interfaces"]), str(row["connection_count"]),
+                      str(row["listening_port_count"]))
+    if not rows:
+        table.add_row("-", "-", "-", "-", "No snapshots stored yet")
     console.print(table)
 
+
+def display_main_menu() -> None:
+    console.print("\n[bold cyan]MAIN MENU[/bold cyan]")
     console.print(
-        "[dim]Note: Traffic values are cumulative counters since the "
-        "system or interface statistics were reset.[/dim]"
+        "1. Refresh network report\n"
+        "2. Filter network connections\n"
+        "3. Start continuous monitoring\n"
+        "4. Capture live packets and save PCAP\n"
+        "5. Analyse an existing PCAP file\n"
+        "6. View security events\n"
+        "7. Investigate events (search/filter/details/export)\n"
+        "8. View monitoring history\n"
+        "9. Export security events (CSV/JSON)\n"
+        "0. Exit"
     )
 
 
-def display_network_connections(connections):
-    """Display active network connections."""
-
-    console.print("\n[bold cyan]4. ACTIVE NETWORK CONNECTIONS[/bold cyan]")
-
-    table = Table(
-        title=f"Network Connections - Total: {len(connections)}",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        expand=True
-    )
-
-    table.add_column("Protocol", style="cyan")
-    table.add_column("Local Address")
-    table.add_column("Remote Address")
-    table.add_column("Status", justify="center")
-    table.add_column("Process ID", justify="right")
-
-    for connection in connections:
-
-        local_address = (
-            f"{connection['local_ip']}:{connection['local_port']}"
-        )
-
-        remote_address = (
-            f"{connection['remote_ip']}:{connection['remote_port']}"
-        )
-
-        table.add_row(
-            str(connection["protocol"]),
-            local_address,
-            remote_address,
-            str(connection["status"]),
-            str(connection["pid"])
-        )
-
-    console.print(table)
-
-
-def display_listening_ports(listening_ports):
-    """Display TCP listening ports."""
-
-    console.print("\n[bold cyan]5. LISTENING PORTS[/bold cyan]")
-
-    table = Table(
-        title=f"Listening Ports - Total: {len(listening_ports)}",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        expand=True
-    )
-
-    table.add_column("Protocol", style="cyan")
-    table.add_column("Local IP Address")
-    table.add_column("Port Number", justify="center")
-    table.add_column("Status", justify="center")
-    table.add_column("Process ID", justify="right")
-
-    for port_info in listening_ports:
-
-        table.add_row(
-            str(port_info["protocol"]),
-            str(port_info["local_ip"]),
-            str(port_info["port"]),
-            str(port_info["status"]),
-            str(port_info["pid"])
-        )
-
-    console.print(table)
-
-    console.print(
-        "[dim]Note: This section currently displays TCP listening "
-        "sockets detected by the monitoring functions.[/dim]"
-    )
-
-
-def create_network_speed_table(speeds):
-    """Create a table showing current upload and download speeds."""
-
-    table = Table(
-        title="Live Network Traffic Speed",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-        expand=True
-    )
-
-    table.add_column("Network Interface", style="cyan")
-    table.add_column("Upload Speed", justify="right", style="green")
-    table.add_column("Download Speed", justify="right", style="blue")
-
-    for interface in speeds:
-
-        upload_speed = (
-            format_bytes(int(interface["upload_speed"])) + "/s"
-        )
-
-        download_speed = (
-            format_bytes(int(interface["download_speed"])) + "/s"
-        )
-
-        table.add_row(
-            interface["name"],
-            upload_speed,
-            download_speed
-        )
-
-    if not speeds:
-        table.add_row("No interfaces available", "-", "-")
-
-    return table
-
-
-def display_live_network_speed():
-    """Display continuously updating network upload and download speeds."""
-
-    console.print("\n[bold cyan]6. LIVE NETWORK SPEED MONITORING[/bold cyan]")
-
-    console.print(
-        "[dim]Press Ctrl+C to stop live monitoring.[/dim]\n"
-    )
-
-    with Live(
-        console=console,
-        refresh_per_second=1
-    ) as live:
-
-        while True:
-
-            # Collect current network speeds
-            speeds = get_network_speed(interval=1.0)
-
-            # Update the dashboard
-            live.update(create_network_speed_table(speeds))
-
-
-def display_report():
-    """Collect and display the complete network monitoring report."""
-
-    # Collect network information
-    interfaces = get_network_interfaces()
-
-    ip_information = get_ip_addresses()
-
-    statistics = get_network_statistics()
-
-    connections = get_network_connections()
-
-    listening_ports = get_listening_ports()
-
-    # Display application header
-    display_header()
-
-    # Display network summary
-    display_network_summary(
-        interfaces,
-        connections,
-        listening_ports
-    )
-
-    # Display all existing monitoring sections
-    display_network_interfaces(interfaces)
-
-    display_ip_information(ip_information)
-
-    display_network_statistics(statistics)
-
-    display_network_connections(connections)
-
-    display_listening_ports(listening_ports)
-
-    # Application footer
-    console.print(
-        Panel(
-            "[bold green]Network monitoring report generated "
-            "successfully![/bold green]",
-            border_style="green",
-            expand=True
-        )
-    )
+def export_events_menu(storage):
+    fmt = console.input("Export format (csv/json): ").strip().lower()
+    path = storage.export_events(fmt)
+    console.print(f"[green]Export created: {path}[/green]")
 
 
 def main():
-    """Main entry point of the network monitoring application."""
+    prepare_directories()
+    settings = Settings.load()
+    storage = Storage()
+    display_header()
+    snapshot = collect_snapshot()
+    display_report(snapshot)
 
-    try:
-
-        # Display the initial network report
-        display_report()
-
-        # Start live network speed monitoring
-        display_live_network_speed()
-
-    except KeyboardInterrupt:
-
-        console.print(
-            "\n[bold yellow]Network monitoring stopped by user.[/bold yellow]"
-        )
-
-    except Exception as error:
-
-        console.print(
-            f"\n[bold red]An error occurred: {error}[/bold red]"
-        )
+    while True:
+        display_main_menu()
+        choice = console.input("Select option: ").strip()
+        try:
+            if choice == "1":
+                snapshot = collect_snapshot()
+                display_report(snapshot)
+            elif choice == "2":
+                filter_menu(snapshot)
+            elif choice == "3":
+                live_monitor(settings, storage)
+            elif choice == "4":
+                packet_capture_menu(settings, storage)
+            elif choice == "5":
+                pcap_analysis_menu(settings, storage)
+            elif choice == "6":
+                show_events(storage)
+            elif choice == "7":
+                investigation_menu(storage)
+            elif choice == "8":
+                show_history(storage)
+            elif choice == "9":
+                export_events_menu(storage)
+            elif choice == "0":
+                console.print("[green]Goodbye.[/green]")
+                break
+            else:
+                console.print("[red]Invalid option. Choose 0-9.[/red]")
+        except ValueError as error:
+            console.print(f"[red]{error}[/red]")
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            console.print(f"[red]Operation failed: {error}[/red]")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Application stopped by user.[/yellow]")
+    except Exception as error:
+        console.print(f"[red]Fatal error: {error}[/red]")

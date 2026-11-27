@@ -32,3 +32,10 @@ dist/
 # Temporary files
 *.log
 *.tmp
+
+# Generated application output (databases, exports, packet captures)
+data/
+exports/
+pcaps/
+*.db
+*.pcap
